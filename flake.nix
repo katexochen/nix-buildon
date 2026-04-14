@@ -14,7 +14,7 @@
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.writeShellApplication {
-          name = "buildon.sh";
+          name = "nix-buildon";
           runtimeInputs = with pkgs; [
             coreutils
             disorderfs

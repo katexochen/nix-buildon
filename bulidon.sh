@@ -45,17 +45,30 @@ function rollback() {
 }
 
 function disorder_helper() {
-    local src="$1"
-    src="$src/disorder$(condStr "$reverse" "-reverse")"
-    local dst="${src}-mnt"
+    local base="$1"
     local reverse="$2"
+    local src
+    src="$base/disorder$(condStr "$reverse" "-reverse" "")"
+    local dst="${src}-mnt"
+
     sx mkdir -p "$src" "$dst"
+
+    # Backing dir must be writable by nix build users, because disorderfs
+    # with --multi-user=yes uses the caller's credentials on the backing fs.
+    sx chown root:nixbld "$src"
+    sx chmod 0770 "$src"
+    # Mountpoint itself should also be accessible.
+    sx chown root:nixbld "$dst"
+    sx chmod 0770 "$dst"
+
     addRollbackStep sudo rm -rf "$src" "$dst"
+
     sx disorderfs \
         --sort-dirents=yes \
         --multi-user=yes \
         --reverse-dirents="$(condStr "$reverse" "yes" "no")" \
         "$src" "$dst" >&2
+
     addRollbackStep sudo umount "$dst"
     echo "$dst"
 }
