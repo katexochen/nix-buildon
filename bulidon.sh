@@ -51,17 +51,17 @@ function disorder_helper() {
     src="$base/disorder$(condStr "$reverse" "-reverse" "")"
     local dst="${src}-mnt"
 
+    sx mkdir -p "$base"
+    sx chown root:nixbld "$base"
+    sx chmod 2775 "$base"
+    sx setfacl -m g:nixbld:rwx "$base"
+    sx setfacl -d -m g:nixbld:rwx "$base"
+
     sx mkdir -p "$src" "$dst"
-
-    # Backing dir must be writable by nix build users, because disorderfs
-    # with --multi-user=yes uses the caller's credentials on the backing fs.
-    sx chown root:nixbld "$src"
-    sx chmod 0770 "$src"
-    # Mountpoint itself should also be accessible.
-    sx chown root:nixbld "$dst"
-    sx chmod 0770 "$dst"
-
-    addRollbackStep sudo rm -rf "$src" "$dst"
+    sx chown root:nixbld "$src" "$dst"
+    sx chmod 2775 "$src" "$dst"
+    sx setfacl -m g:nixbld:rwx "$src" "$dst"
+    sx setfacl -d -m g:nixbld:rwx "$src" "$dst"
 
     sx disorderfs \
         --sort-dirents=yes \
@@ -69,7 +69,14 @@ function disorder_helper() {
         --reverse-dirents="$(condStr "$reverse" "yes" "no")" \
         "$src" "$dst" >&2
 
+    sx chown root:nixbld "$dst"
+    sx chmod 2775 "$dst"
+    sx setfacl -m g:nixbld:rwx "$dst"
+    sx setfacl -d -m g:nixbld:rwx "$dst"
+
     addRollbackStep sudo umount "$dst"
+    addRollbackStep sudo rm -rf "$src" "$dst"
+
     echo "$dst"
 }
 
