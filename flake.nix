@@ -15,6 +15,9 @@
             tag = "${finalAttrs.version}";
             hash = "sha256-1ehGbNYbOewnDrQ1JhozKMvfVaCH7sDCxrD0dvwAfw0=";
           };
+          patches = [
+            ./patches/disorderfs-no-default-permissions-multi-user.patch
+          ];
           nativeBuildInputs = with final; [
             pkg-config
             asciidoc-full
@@ -49,6 +52,31 @@
           ];
           text = builtins.readFile ./bulidon.sh;
         };
+
+        tests =
+          let
+            simScript = pkgs.writeScript "nix-sandbox-sim.sh" (builtins.readFile ./tests/nix-sandbox-sim.sh);
+          in
+          pkgs.writeShellApplication {
+            name = "nix-buildon-tests";
+            runtimeInputs = with pkgs; [
+              acl
+              coreutils
+              disorderfs
+              gnugrep
+              libseccomp.lib
+              nix
+              python3
+              util-linux
+            ];
+            excludeShellChecks = [
+              "SC2016" # intentional single-quote-break variable injection
+              "SC2064" # intentional early expansion in trap
+            ];
+            text = ''
+              export NIX_SANDBOX_SIM="${simScript}"
+            '' + builtins.readFile ./tests/run-tests.sh;
+          };
       });
     };
 }

@@ -1,0 +1,60 @@
+From: nix-buildon
+Subject: Skip default_permissions and privilege dropping in multi-user mode
+
+In multi-user mode with allow_other, the kernel FUSE module gates
+access via fuse_allow_current_process() which checks allow_other and
+verifies the caller is in the same user namespace or a descendant.
+
+Two changes for multi-user mode:
+
+1. Remove default_permissions: this kernel-level DAC check uses
+   capable_wrt_inode_uidgid() which verifies CAP_DAC_OVERRIDE in
+   the FUSE mount's user namespace. Callers in a child user namespace
+   (e.g. Nix sandbox) lack capabilities in the host namespace,
+   causing EACCES for operations that would succeed on a regular FS.
+
+2. Skip Guard::drop_privileges(): the Guard does seteuid(caller_uid)
+   then accesses the backing filesystem. This breaks when the FUSE
+   path traverses intermediate directories on the backing FS that
+   the caller can't search (e.g. Nix creates root-owned 0700 temp
+   dirs). Without dropping privileges, the daemon accesses the
+   backing FS as root, relying on FUSE's allow_other + userns check
+   for access control.
+
+--- a/disorderfs.cpp
++++ b/disorderfs.cpp
+@@ -150,13 +150,16 @@
+ struct Guard {
+     Guard ()
+     {
+-        if (config.multi_user && getuid() == 0) {
++        // In multi-user mode, skip drop_privileges: the backing FS is
++        // accessed as root to avoid path traversal issues on intermediate
++        // directories that the calling user cannot traverse.
++        if (!config.multi_user && getuid() == 0) {
+             drop_privileges();
+         }
+     }
+     ~Guard ()
+     {
+-        if (config.multi_user && getuid() == 0) {
++        if (!config.multi_user && getuid() == 0) {
+             restore_privileges();
+         }
+     }
+@@ -268,8 +271,13 @@
+     }
+ 
+     // Add some of our own hard-coded FUSE options:
+-    fuse_opt_add_arg(&fargs, "-o");
+-    fuse_opt_add_arg(&fargs, "default_permissions"); // XXX: other mount options?
++    // In multi-user mode, skip default_permissions: the kernel DAC check
++    // breaks callers in child user namespaces (e.g. Nix sandbox) because
++    // CAP_DAC_OVERRIDE is checked in the FUSE mount's user namespace.
++    if (!config.multi_user) {
++        fuse_opt_add_arg(&fargs, "-o");
++        fuse_opt_add_arg(&fargs, "default_permissions");
++    }
+     if (config.multi_user) {
+         fuse_opt_add_arg(&fargs, "-o");
+         fuse_opt_add_arg(&fargs, "allow_other");

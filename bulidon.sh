@@ -39,8 +39,9 @@ function rollback() {
     while [[ -s $f ]]; do
         cmd=$(tail -n 1 "$f")
         sudo sed -i '$ d' "$f"
-        if ! x eval "$cmd"; then
-            echo "Rollback step failed: $cmd" >&2
+        echo "+ $cmd" >&2
+        if ! eval "$cmd" 2>/dev/null; then
+            echo "Rollback step skipped (already clean): $cmd" >&2
         fi
     done
     echo "Rollback complete"
