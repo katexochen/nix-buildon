@@ -9,18 +9,13 @@ function condStr() {
     if [[ $1 == "true" ]]; then echo "$2"; else echo "$3"; fi
 }
 
-function x() {
-    echo + "$@" >&2
-    "$@" || fail operation failed
-}
-
 function sx() {
     echo + sudo "$@" >&2
-    sudo env "PATH=$PATH" "$@" || fail operation failed
+    sudo env "PATH=$PATH" "$@" || fail "operation failed"
 }
 
 function fail() {
-    echo Error: "$@" >&2
+    echo "Error: $*" >&2
     exit 1
 }
 
@@ -55,16 +50,12 @@ function disorder_helper() {
     local dst="${src}-mnt"
 
     sx mkdir -p "$base"
-    sx chown root:nixbld "$base"
-    sx chmod 2775 "$base"
-    sx setfacl -m g:nixbld:rwx "$base"
-    sx setfacl -d -m g:nixbld:rwx "$base"
+    sx chmod 0700 "$base"
 
     sx mkdir -p "$src" "$dst"
-    sx chown root:nixbld "$src" "$dst"
-    sx chmod 2775 "$src" "$dst"
-    sx setfacl -m g:nixbld:rwx "$src"
-    sx setfacl -d -m g:nixbld:rwx "$src"
+    addRollbackStep sudo rm -rf "$src" "$dst"
+
+    sx chmod 0700 "$src" "$dst"
 
     sx disorderfs \
         --sort-dirents=yes \
@@ -72,11 +63,7 @@ function disorder_helper() {
         --reverse-dirents="$(condStr "$reverse" "yes" "no")" \
         "$src" "$dst" >&2
 
-    sx chown root:nixbld "$dst"
-    sx chmod 2775 "$dst"
-
     addRollbackStep sudo umount "$dst"
-    addRollbackStep sudo rm -rf "$src" "$dst"
 
     echo "$dst"
 }
@@ -116,15 +103,16 @@ function configure() {
 }
 
 function check() {
+    local result
     # shellcheck disable=SC2016
-    check="$(nix-build -E '(import <nixpkgs> {}).runCommand "buildon-check-'"$(date +%s)"'" {} "stat -f -c %T . > $out"' 2>/dev/null)" ||
+    result="$(nix-build -E '(import <nixpkgs> {}).runCommand "buildon-check-'"$(date +%s)"'" {} "stat -f -c %T . > $out"' 2>/dev/null)" ||
         fail "Failed to run nix build"
-    echo "nix build running on $(cat "$check")"
+    echo "nix build running on $(cat "$result")"
 }
 
 function main() {
-    local path
-    path="$STATE_DIR/work"
+    local path="$STATE_DIR/work"
+    local size="$DEFAULT_VOLUME_SIZE"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -145,8 +133,7 @@ function main() {
             exit 0
             ;;
         --*)
-            echo "Unknown option: $1"
-            exit 1
+            fail "Unknown option: $1"
             ;;
         *)
             break
@@ -156,36 +143,30 @@ function main() {
 
     # Clean up previous state
     if ! rollback; then
-        echo "Failed to rollback previous state"
-        exit 1
+        fail "Failed to rollback previous state"
     fi
 
-    case "$1" in
+    local tmpDir
+    case "${1:?usage: bulidon <disorderfs|disorderfs-reverse|btrfs|ext4>}" in
     disorderfs)
-        shift
         tmpDir=$(disorder_helper "$path" false)
         ;;
     disorderfs-reverse)
-        shift
         tmpDir=$(disorder_helper "$path" true)
         ;;
     btrfs)
-        shift
-        tmpDir=$(mkfs_helper btrfs "$path" "${@}")
+        tmpDir=$(mkfs_helper btrfs "$path" "$size")
         ;;
     ext4)
-        shift
-        tmpDir=$(mkfs_helper ext4 "$path" "${@}")
+        tmpDir=$(mkfs_helper ext4 "$path" "$size")
         ;;
     *)
-        echo "Unknown fs: $1"
-        exit 1
+        fail "Unknown fs: $1"
         ;;
     esac
 
     if ! configure "$tmpDir"; then
-        echo "Failed to configure nix"
-        exit 1
+        fail "Failed to configure nix"
     fi
 }
 
