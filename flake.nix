@@ -16,7 +16,8 @@
             hash = "sha256-1ehGbNYbOewnDrQ1JhozKMvfVaCH7sDCxrD0dvwAfw0=";
           };
           patches = [
-            ./patches/disorderfs-no-default-permissions-multi-user.patch
+            ./patches/0001-skip-default-permissions-multi-user.patch
+            ./patches/0002-openat-fd-relative-syscalls.patch
           ];
           nativeBuildInputs = with final; [
             pkg-config

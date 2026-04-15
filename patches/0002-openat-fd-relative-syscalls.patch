@@ -1,0 +1,467 @@
+From c78a82f52bdd6b4749d9daf200227157b720ff81 Mon Sep 17 00:00:00 2001
+From: Paul Meyer <katexochen0@gmail.com>
+Date: Wed, 15 Apr 2026 16:28:15 +0200
+Subject: [PATCH] Use fd-relative syscalls to avoid intermediate directory
+ traversal
+
+In multi-user mode, Guard::drop_privileges() sets the thread's euid
+to the FUSE caller before accessing the backing filesystem. This
+causes EACCES when intermediate directories on the backing FS path
+are not traversable by the caller (e.g. Nix creates root:root 0700
+temp dirs, then chowns only the leaf build/ subdirectory).
+
+Replace all path-based syscalls (open, lstat, mkdir, etc.) with
+fd-relative equivalents (openat, fstatat, mkdirat, etc.):
+
+1. Walk ancestor path components as root using
+   openat(O_PATH|O_NOFOLLOW|O_DIRECTORY) to pin the parent dir.
+2. Drop privileges to the FUSE caller.
+3. Perform the leaf operation via *at() relative to the pinned fd.
+
+This preserves per-file authorization (the caller still needs
+permission on the target file and its immediate parent) while
+avoiding spurious failures from inaccessible ancestor directories.
+
+For xattr operations which have no *at() variants, use an O_PATH fd
+and operate via /proc/self/fd/N to preserve no-follow semantics.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-019d916b-f8b6-745a-8c11-6768858e16ce
+Co-authored-by: Amp <amp@ampcode.com>
+
+Signed-off-by: Paul Meyer <katexochen0@gmail.com>
+Co-authored-by: Amp <amp@ampcode.com>
+Amp-Thread-ID: https://ampcode.com/threads/T-019d916b-f8b6-745a-8c11-6768858e16ce
+---
+ disorderfs.cpp | 290 +++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 242 insertions(+), 48 deletions(-)
+
+diff --git a/disorderfs.cpp b/disorderfs.cpp
+index e9edb6d..d2e3ff3 100644
+--- a/disorderfs.cpp
++++ b/disorderfs.cpp
+@@ -38,6 +38,7 @@
+ #include <sys/types.h>
+ #include <sys/syscall.h>
+ #include <sys/file.h>
++#include <fcntl.h>
+ #include <stddef.h>
+ 
+ #define DISORDERFS_VERSION "0.6.2"
+@@ -45,6 +46,7 @@
+ namespace {
+ std::vector<std::string>        bare_arguments;
+ std::string                        root;
++int                                root_fd{-1};
+ struct Disorderfs_config {
+     // ATTENTION! Members of this struct MUST be ints, even the booleans, because
+     // that's what fuse_opt_parse expects.  Take heed or you will get memory corruption!
+@@ -147,8 +149,99 @@ void restore_privileges ()
+     }
+ }
+ 
++// Resolve a FUSE path to parent directory fd, leaf name, and optionally
++// an O_PATH fd to the target itself.  The entire walk (including the
++// leaf lookup for the target fd) is done as root so that intermediate
++// directories the caller cannot search do not cause spurious EACCES.
++//
++// Operations that ACCESS the target (stat, opendir, xattr, …) should
++// use target_fd.  Operations that CREATE/DELETE in the parent (mkdir,
++// unlink, …) should use parent_fd + leaf.
++struct ResolvedPath {
++    int parent_fd;        // O_PATH fd to the leaf's parent directory
++    int target_fd;        // O_PATH fd to the target itself, or -1
++    std::string leaf;
++    bool parent_needs_close;
++    bool target_needs_close;
++
++    void close_all () {
++        if (target_needs_close && target_fd >= 0) { close(target_fd); target_fd = -1; }
++        if (parent_needs_close && parent_fd >= 0) { close(parent_fd); parent_fd = -1; }
++    }
++};
++
++// Walk all path components as root, returning parent_fd + leaf.
++// Does NOT open target_fd; call resolve_target() for that.
++ResolvedPath resolve_parent (const char* fuse_path)
++{
++    const char* p = fuse_path;
++    if (*p == '/') p++;
++
++    if (*p == '\0') {
++        return {root_fd, -1, "", false, false};
++    }
++
++    std::vector<std::string> components;
++    std::string remaining(p);
++    size_t pos;
++    while ((pos = remaining.find('/')) != std::string::npos) {
++        components.push_back(remaining.substr(0, pos));
++        remaining = remaining.substr(pos + 1);
++    }
++
++    if (components.empty()) {
++        return {root_fd, -1, remaining, false, false};
++    }
++
++    std::string leaf = remaining;
++    int current_fd = root_fd;
++    bool current_needs_close = false;
++    for (const auto& comp : components) {
++        int next_fd = openat(current_fd, comp.c_str(),
++                             O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
++        if (next_fd == -1) {
++            if (current_needs_close) close(current_fd);
++            return {-1, -1, "", false, false};
++        }
++        if (current_needs_close) close(current_fd);
++        current_fd = next_fd;
++        current_needs_close = true;
++    }
++    return {current_fd, -1, leaf, current_needs_close, false};
++}
++
++// Resolve the full path including the leaf.  Returns both parent_fd
++// (for namespace operations) and target_fd (for operations on the
++// target itself).  Both are obtained as root.
++ResolvedPath resolve_target (const char* fuse_path)
++{
++    ResolvedPath rp = resolve_parent(fuse_path);
++    if (rp.parent_fd == -1) return rp;
++
++    if (rp.leaf.empty()) {
++        // Root path: target IS root_fd
++        rp.target_fd = root_fd;
++        rp.target_needs_close = false;
++        return rp;
++    }
++
++    rp.target_fd = openat(rp.parent_fd, rp.leaf.c_str(),
++                          O_PATH | O_NOFOLLOW | O_CLOEXEC);
++    if (rp.target_fd == -1) {
++        int err = errno;
++        rp.close_all();
++        rp.parent_fd = -1;
++        errno = err;
++        return rp;
++    }
++    rp.target_needs_close = true;
++    return rp;
++}
++
+ struct Guard {
+-    Guard ()
++    ResolvedPath* resolved;
++
++    Guard (ResolvedPath* rp = nullptr) : resolved(rp)
+     {
+         if (config.multi_user && getuid() == 0) {
+             drop_privileges();
+@@ -159,6 +252,7 @@ struct Guard {
+         if (config.multi_user && getuid() == 0) {
+             restore_privileges();
+         }
++        if (resolved) resolved->close_all();
+     }
+ };
+ 
+@@ -267,6 +361,12 @@ int        main (int argc, char** argv)
+         return 1;
+     }
+ 
++    root_fd = open(root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
++    if (root_fd == -1) {
++        std::perror(root.c_str());
++        return 1;
++    }
++
+     // Add some of our own hard-coded FUSE options:
+     if (!config.multi_user) {
+         fuse_opt_add_arg(&fargs, "-o");
+@@ -295,13 +395,16 @@ int        main (int argc, char** argv)
+      */
+ 
+     disorderfs_fuse_operations.getattr = [] (const char* path, struct stat* st, struct fuse_file_info *info) -> int {
+-        Guard g;
+         if (info) {
+           if (fstat(info->fh, st) == -1) {
+               return -errno;
+           }
+         } else {
+-          if (lstat((root + path).c_str(), st) == -1) {
++          // Resolve target as root; fstat on O_PATH fd needs no perms
++          ResolvedPath rp = resolve_target(path);
++          if (rp.parent_fd == -1) return -errno;
++          Guard g(&rp);
++          if (fstat(rp.target_fd, st) == -1) {
+               return -errno;
+           }
+         }
+@@ -309,8 +412,10 @@ int        main (int argc, char** argv)
+         return 0;
+     };
+     disorderfs_fuse_operations.readlink = [] (const char* path, char* buf, size_t sz) -> int {
+-        Guard g;
+-        const ssize_t len{readlink((root + path).c_str(), buf, sz - 1)}; // sz > 0, since it includes space for null terminator
++        ResolvedPath rp = resolve_parent(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        const ssize_t len{readlinkat(rp.parent_fd, rp.leaf.c_str(), buf, sz - 1)};
+         if (len == -1) {
+             return -errno;
+         }
+@@ -318,53 +423,110 @@ int        main (int argc, char** argv)
+         return 0;
+     };
+     disorderfs_fuse_operations.mknod = [] (const char* path, mode_t mode, dev_t dev) -> int {
+-        Guard g;
+-        return wrap(mknod((root + path).c_str(), mode, dev));
++        ResolvedPath rp = resolve_parent(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        return wrap(mknodat(rp.parent_fd, rp.leaf.c_str(), mode, dev));
+     };
+     disorderfs_fuse_operations.mkdir = [] (const char* path, mode_t mode) -> int {
+-        Guard g;
+-        return wrap(mkdir((root + path).c_str(), mode));
++        ResolvedPath rp = resolve_parent(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        return wrap(mkdirat(rp.parent_fd, rp.leaf.c_str(), mode));
+     };
+     disorderfs_fuse_operations.unlink = [] (const char* path) -> int {
+-        Guard g;
+-        return wrap(unlink((root + path).c_str()));
++        ResolvedPath rp = resolve_parent(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        return wrap(unlinkat(rp.parent_fd, rp.leaf.c_str(), 0));
+     };
+     disorderfs_fuse_operations.rmdir = [] (const char* path) -> int {
+-        Guard g;
+-        return wrap(rmdir((root + path).c_str()));
++        ResolvedPath rp = resolve_parent(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        return wrap(unlinkat(rp.parent_fd, rp.leaf.c_str(), AT_REMOVEDIR));
+     };
+     disorderfs_fuse_operations.symlink = [] (const char* target, const char* linkpath) -> int {
+-        Guard g;
+-        return wrap(symlink(target, (root + linkpath).c_str()));
++        ResolvedPath rp = resolve_parent(linkpath);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        return wrap(symlinkat(target, rp.parent_fd, rp.leaf.c_str()));
+     };
+     disorderfs_fuse_operations.rename = [] (const char* oldpath, const char* newpath, unsigned int flags) -> int {
+-        // NEEDS TEST: flags may be RENAME_EXCHANGE and RENAME_NOREPLACE
+-        Guard g;
+-        return wrap(rename((root + oldpath).c_str(), (root + newpath).c_str()));
++        ResolvedPath rp_old = resolve_parent(oldpath);
++        if (rp_old.parent_fd == -1) return -errno;
++        ResolvedPath rp_new = resolve_parent(newpath);
++        if (rp_new.parent_fd == -1) { rp_old.close_all(); return -errno; }
++        Guard g_old(&rp_old);
++        // rp_new cleanup is manual since Guard only takes one
++        int result;
++        if (flags) {
++            result = wrap(syscall(SYS_renameat2, rp_old.parent_fd, rp_old.leaf.c_str(),
++                                  rp_new.parent_fd, rp_new.leaf.c_str(), flags));
++        } else {
++            result = wrap(renameat(rp_old.parent_fd, rp_old.leaf.c_str(),
++                                   rp_new.parent_fd, rp_new.leaf.c_str()));
++        }
++        rp_new.close_all();
++        return result;
+     };
+     disorderfs_fuse_operations.link = [] (const char* oldpath, const char* newpath) -> int {
+-        Guard g;
+-        return wrap(link((root + oldpath).c_str(), (root + newpath).c_str()));
++        ResolvedPath rp_old = resolve_parent(oldpath);
++        if (rp_old.parent_fd == -1) return -errno;
++        ResolvedPath rp_new = resolve_parent(newpath);
++        if (rp_new.parent_fd == -1) { rp_old.close_all(); return -errno; }
++        Guard g_old(&rp_old);
++        int result = wrap(linkat(rp_old.parent_fd, rp_old.leaf.c_str(),
++                                 rp_new.parent_fd, rp_new.leaf.c_str(), 0));
++        rp_new.close_all();
++        return result;
+     };
+     disorderfs_fuse_operations.chmod = [] (const char* path, mode_t mode, struct fuse_file_info* info) -> int {
+-        Guard g;
+-        return wrap(chmod((root + path).c_str(), mode));
++        // Resolve target as root, then chmod via /proc/self/fd/N
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        return wrap(chmod(proc_path.c_str(), mode));
+     };
+     disorderfs_fuse_operations.chown = [] (const char* path, uid_t uid, gid_t gid, struct fuse_file_info* info) -> int {
+-        Guard g;
+-        return wrap(lchown((root + path).c_str(), uid, gid));
++        // Resolve target as root, then chown via /proc/self/fd/N
++        // (fchownat with AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH)
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        // Use chown (not lchown): the O_PATH fd was obtained with O_NOFOLLOW
++        // so it already points to the correct target.  Following the procfs
++        // magic symlink is required to reach the actual file.
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        return wrap(chown(proc_path.c_str(), uid, gid));
+     };
+     disorderfs_fuse_operations.truncate = [] (const char* path, off_t length, struct fuse_file_info* info) -> int {
+-        Guard g;
+         if (info) {
+           return wrap(ftruncate(info->fh, length));
+-        } else {
+-          return wrap(truncate((root + path).c_str(), length));
+         }
++        // Resolve target as root, reopen for writing after drop_privs
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        int fd = openat(rp.target_fd, "", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
++        if (fd == -1) {
++            // O_EMPTY_PATH not available; fall back to /proc/self/fd/N
++            std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++            fd = open(proc_path.c_str(), O_WRONLY | O_CLOEXEC);
++            if (fd == -1) return -errno;
++        }
++        int rc = wrap(ftruncate(fd, length));
++        close(fd);
++        return rc;
+     };
+     disorderfs_fuse_operations.open = [] (const char* path, struct fuse_file_info* info) -> int {
+-        Guard g;
+-        const int fd{open((root + path).c_str(), info->flags)};
++        // Resolve target as root, reopen with caller's flags after drop_privs
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        const int fd{open(proc_path.c_str(), info->flags)};
+         if (fd == -1) {
+             return -errno;
+         }
+@@ -398,8 +560,11 @@ int        main (int argc, char** argv)
+         return bytes_written;
+     };
+     disorderfs_fuse_operations.statfs = [] (const char* path, struct statvfs* f) -> int {
+-        Guard g;
+-        return wrap(statvfs((root + path).c_str(), f));
++        // Resolve target as root; fstatvfs on the fd
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        return wrap(fstatvfs(rp.target_fd, f));
+     };
+     disorderfs_fuse_operations.flush = [] (const char* path, struct fuse_file_info* info) -> int {
+         return wrap(close(dup(info->fh)));
+@@ -412,30 +577,50 @@ int        main (int argc, char** argv)
+         return wrap(is_datasync ? fdatasync(info->fh) : fsync(info->fh));
+     };
+     disorderfs_fuse_operations.setxattr = [] (const char* path, const char* name, const char* value, size_t size, int flags) -> int {
+-        Guard g;
+-        return wrap(lsetxattr((root + path).c_str(), name, value, size, flags));
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        return wrap(setxattr(proc_path.c_str(), name, value, size, flags));
+     };
+     disorderfs_fuse_operations.getxattr = [] (const char* path, const char* name, char* value, size_t size) -> int {
+-        Guard g;
+-        ssize_t res = lgetxattr((root + path).c_str(), name, value, size);
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        ssize_t res = getxattr(proc_path.c_str(), name, value, size);
+         return res >= 0 ? res : -errno;
+     };
+     disorderfs_fuse_operations.listxattr = [] (const char* path, char* list, size_t size) -> int {
+-        Guard g;
+-        ssize_t res = llistxattr((root + path).c_str(), list, size);
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        ssize_t res = listxattr(proc_path.c_str(), list, size);
+         return res >= 0 ? res : -errno;
+     };
+     disorderfs_fuse_operations.removexattr = [] (const char* path, const char* name) -> int {
+-        Guard g;
+-        return wrap(lremovexattr((root + path).c_str(), name));
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        return wrap(removexattr(proc_path.c_str(), name));
+     };
+     disorderfs_fuse_operations.opendir = [] (const char* path, struct fuse_file_info* info) -> int {
+-        Guard g;
++        // Resolve target as root, then reopen via "." after drop_privs
++        // so only the target dir's own permissions are checked (not parent's).
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
+         std::unique_ptr<Dirents> dirents{new Dirents};
+ 
+-        DIR* d = opendir((root + path).c_str());
++        int fd = openat(rp.target_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++        if (fd == -1) return -errno;
++        DIR* d = fdopendir(fd);
+         if (!d) {
+-            return -errno;
++            int err = errno;
++            close(fd);
++            return -err;
+         }
+         struct dirent*        dirent_p;
+         errno = 0;
+@@ -443,7 +628,9 @@ int        main (int argc, char** argv)
+             dirents->emplace_back(std::make_pair(dirent_p->d_name, dirent_p->d_ino));
+         }
+         if (errno != 0) {
+-            return -errno;
++            int err = errno;
++            closedir(d);
++            return -err;
+         }
+         if (config.sort_dirents) {
+             std::sort(dirents->begin(), dirents->end());
+@@ -492,9 +679,10 @@ int        main (int argc, char** argv)
+         return nullptr;
+     };
+     disorderfs_fuse_operations.create = [] (const char* path, mode_t mode, struct fuse_file_info* info) -> int {
+-        Guard g;
+-        // XXX: use info->flags?
+-        const int fd{open((root + path).c_str(), info->flags | O_CREAT, mode)};
++        ResolvedPath rp = resolve_parent(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        const int fd{openat(rp.parent_fd, rp.leaf.c_str(), info->flags | O_CREAT, mode)};
+         if (fd == -1) {
+             return -errno;
+         }
+@@ -505,8 +693,14 @@ int        main (int argc, char** argv)
+         perror_and_die("The share-locks feature is no longer provided in fuse3");
+     }
+     disorderfs_fuse_operations.utimens = [] (const char* path, const struct timespec tv[2], struct fuse_file_info *info) -> int {
+-        Guard g;
+-        return wrap(utimensat(AT_FDCWD, (root + path).c_str(), tv, AT_SYMLINK_NOFOLLOW));
++        // Resolve target as root, then utimensat via the target fd
++        ResolvedPath rp = resolve_target(path);
++        if (rp.parent_fd == -1) return -errno;
++        Guard g(&rp);
++        std::string proc_path = "/proc/self/fd/" + std::to_string(rp.target_fd);
++        // Use flags=0 (not AT_SYMLINK_NOFOLLOW): must follow the procfs
++        // magic symlink to reach the actual file.
++        return wrap(utimensat(AT_FDCWD, proc_path.c_str(), tv, 0));
+     };
+     /* Not applicable?
+     disorderfs_fuse_operations.bmap = [] (const char *, size_t blocksize, uint64_t *idx) -> int {
+-- 
+2.53.0
+

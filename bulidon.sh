@@ -63,8 +63,8 @@ function disorder_helper() {
     sx mkdir -p "$src" "$dst"
     sx chown root:nixbld "$src" "$dst"
     sx chmod 2775 "$src" "$dst"
-    sx setfacl -m g:nixbld:rwx "$src" "$dst"
-    sx setfacl -d -m g:nixbld:rwx "$src" "$dst"
+    sx setfacl -m g:nixbld:rwx "$src"
+    sx setfacl -d -m g:nixbld:rwx "$src"
 
     sx disorderfs \
         --sort-dirents=yes \
@@ -74,8 +74,6 @@ function disorder_helper() {
 
     sx chown root:nixbld "$dst"
     sx chmod 2775 "$dst"
-    sx setfacl -m g:nixbld:rwx "$dst"
-    sx setfacl -d -m g:nixbld:rwx "$dst"
 
     addRollbackStep sudo umount "$dst"
     addRollbackStep sudo rm -rf "$src" "$dst"

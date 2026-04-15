@@ -1,0 +1,46 @@
+From 9a84dd62158741241deddc147f1a22214ae9f56e Mon Sep 17 00:00:00 2001
+From: Paul Meyer <katexochen0@gmail.com>
+Date: Wed, 15 Apr 2026 16:25:52 +0200
+Subject: [PATCH] Skip default_permissions in multi-user mode
+
+In multi-user mode with allow_other, the kernel FUSE module gates
+access via fuse_allow_current_process() which checks allow_other and
+verifies the caller is in the same user namespace or a descendant.
+
+Remove default_permissions in multi-user mode: this kernel-level DAC
+check uses capable_wrt_inode_uidgid() which verifies CAP_DAC_OVERRIDE
+in the FUSE mount's user namespace. Callers in a child user namespace
+(e.g. Nix sandbox) lack capabilities in the host namespace, causing
+EACCES for operations that would succeed on a regular FS.
+
+Without default_permissions, the FUSE daemon's own backing-FS access
+(via Guard::drop_privileges) still enforces per-file authorization.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-019d916b-f8b6-745a-8c11-6768858e16ce
+Co-authored-by: Amp <amp@ampcode.com>
+
+Signed-off-by: Paul Meyer <katexochen0@gmail.com>
+---
+ disorderfs.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/disorderfs.cpp b/disorderfs.cpp
+index d2c4eda..e9edb6d 100644
+--- a/disorderfs.cpp
++++ b/disorderfs.cpp
+@@ -268,8 +268,10 @@ int        main (int argc, char** argv)
+     }
+ 
+     // Add some of our own hard-coded FUSE options:
+-    fuse_opt_add_arg(&fargs, "-o");
+-    fuse_opt_add_arg(&fargs, "default_permissions"); // XXX: other mount options?
++    if (!config.multi_user) {
++        fuse_opt_add_arg(&fargs, "-o");
++        fuse_opt_add_arg(&fargs, "default_permissions");
++    }
+     if (config.multi_user) {
+         fuse_opt_add_arg(&fargs, "-o");
+         fuse_opt_add_arg(&fargs, "allow_other");
+-- 
+2.53.0
+
