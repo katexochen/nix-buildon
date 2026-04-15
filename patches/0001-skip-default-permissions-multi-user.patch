@@ -1,20 +1,22 @@
-From 9a84dd62158741241deddc147f1a22214ae9f56e Mon Sep 17 00:00:00 2001
+From afa050a9a69f5d268bef4d23b22f9fd67204d79a Mon Sep 17 00:00:00 2001
 From: Paul Meyer <katexochen0@gmail.com>
-Date: Wed, 15 Apr 2026 16:25:52 +0200
+Date: Wed, 15 Apr 2026 21:23:10 +0200
 Subject: [PATCH] Skip default_permissions in multi-user mode
 
-In multi-user mode with allow_other, the kernel FUSE module gates
-access via fuse_allow_current_process() which checks allow_other and
-verifies the caller is in the same user namespace or a descendant.
+In multi-user mode, disorderfs already enforces access control by
+dropping privileges to the FUSE caller (via Guard::drop_privileges)
+before touching the backing filesystem.
 
-Remove default_permissions in multi-user mode: this kernel-level DAC
-check uses capable_wrt_inode_uidgid() which verifies CAP_DAC_OVERRIDE
-in the FUSE mount's user namespace. Callers in a child user namespace
-(e.g. Nix sandbox) lack capabilities in the host namespace, causing
-EACCES for operations that would succeed on a regular FS.
+The kernel's default_permissions check rejects some accesses before
+the daemon sees them, particularly from processes in child user
+namespaces: the DAC check uses capable_wrt_inode_uidgid() which
+requires CAP_DAC_OVERRIDE in the FUSE mount's user namespace.
+Callers in a child user namespace lack this capability, so
+operations that would succeed on a regular filesystem fail with
+EACCES.
 
-Without default_permissions, the FUSE daemon's own backing-FS access
-(via Guard::drop_privileges) still enforces per-file authorization.
+Skip default_permissions in multi-user mode since the daemon's own
+privilege-dropping mechanism provides the necessary authorization.
 
 Amp-Thread-ID: https://ampcode.com/threads/T-019d916b-f8b6-745a-8c11-6768858e16ce
 Co-authored-by: Amp <amp@ampcode.com>
