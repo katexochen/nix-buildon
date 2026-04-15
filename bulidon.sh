@@ -30,7 +30,7 @@ function addRollbackStep() {
 }
 
 function rollback() {
-    local f
+    local f cmd
     f="$STATE_DIR/rollback"
     if [[ ! -s $f ]]; then
         echo "No rollback steps to perform"
@@ -39,7 +39,9 @@ function rollback() {
     while [[ -s $f ]]; do
         cmd=$(tail -n 1 "$f")
         sudo sed -i '$ d' "$f"
-        x eval "$cmd"
+        if ! x eval "$cmd"; then
+            echo "Rollback step failed: $cmd" >&2
+        fi
     done
     echo "Rollback complete"
 }
