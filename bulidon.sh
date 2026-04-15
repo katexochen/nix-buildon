@@ -49,13 +49,8 @@ function disorder_helper() {
     src="$base/disorder$(condStr "$reverse" "-reverse" "")"
     local dst="${src}-mnt"
 
-    sx mkdir -p "$base"
-    sx chmod 0700 "$base"
-
-    sx mkdir -p "$src" "$dst"
+    sx install -d -m 0700 "$base" "$src" "$dst"
     addRollbackStep sudo rm -rf "$src" "$dst"
-
-    sx chmod 0700 "$src" "$dst"
 
     sx disorderfs \
         --sort-dirents=yes \
