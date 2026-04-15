@@ -53,6 +53,11 @@
           text = builtins.readFile ./bulidon.sh;
         };
 
+        order = pkgs.runCommand "order-test" { } ''
+          touch a b c
+          ls -U > $out
+        '';
+
         tests =
           let
             simScript = pkgs.writeScript "nix-sandbox-sim.sh" (builtins.readFile ./tests/nix-sandbox-sim.sh);
@@ -75,7 +80,8 @@
             ];
             text = ''
               export NIX_SANDBOX_SIM="${simScript}"
-            '' + builtins.readFile ./tests/run-tests.sh;
+            ''
+            + builtins.readFile ./tests/run-tests.sh;
           };
       });
     };
