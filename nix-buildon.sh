@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly DEFAULT_VOLUME_SIZE=8G
+readonly DEFAULT_VOLUME_SIZE=30G
 readonly STATE_DIR=/var/lib/buildon
 
 function condStr() {
@@ -105,6 +105,26 @@ function check() {
     echo "nix build running on $(cat "$result")"
 }
 
+function usage() {
+    cat <<EOF
+Usage: nix-buildon [OPTIONS] <FILESYSTEM>
+
+Configure the Nix daemon to run builds on a specific filesystem.
+
+Filesystems:
+  disorderfs           Use disorderfs to randomize directory entry order
+  disorderfs-reverse   Use disorderfs with reversed directory entry order
+  btrfs                Create and mount a btrfs image for builds
+  ext4                 Create and mount an ext4 image for builds
+
+Options:
+  --size=SIZE   Size of the filesystem image (default: $DEFAULT_VOLUME_SIZE, only for btrfs/ext4)
+  --check       Print the filesystem type the Nix daemon is currently building on
+  --reset       Roll back to the previous configuration
+  -h, --help    Show this help message
+EOF
+}
+
 function main() {
     local path="$STATE_DIR/work"
     local size="$DEFAULT_VOLUME_SIZE"
@@ -114,6 +134,10 @@ function main() {
         --)
             shift
             break
+            ;;
+        -h | --help)
+            usage
+            exit 0
             ;;
         --size=*)
             size="${1#*=}"
@@ -142,7 +166,7 @@ function main() {
     fi
 
     local tmpDir
-    case "${1:?usage: bulidon <disorderfs|disorderfs-reverse|btrfs|ext4>}" in
+    case "${1:?$(usage)}" in
     disorderfs)
         tmpDir=$(disorder_helper "$path" false)
         ;;

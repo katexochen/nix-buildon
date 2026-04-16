@@ -51,7 +51,7 @@
             systemd
             nix
           ];
-          text = builtins.readFile ./bulidon.sh;
+          text = builtins.readFile ./nix-buildon.sh;
         };
 
         order = pkgs.runCommand "order-test" { } ''
