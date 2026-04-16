@@ -115,4 +115,4 @@ Or add it to your system packages via the flake.
 
 ---
 
-This project was made (in huge parts) at [OceanSprint](https://oceansprint.org/)!
+This project was made (in huge parts) at [OceanSprint 2026](https://oceansprint.org/)!
